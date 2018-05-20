@@ -51,6 +51,19 @@ import static com.android.internal.telephony.uicc.IccCardStatus.CardState.CARDST
 
 public class HwExtTelephony extends IExtTelephony.Stub {
 
+    class UiccStatus {
+
+        boolean provisioned;
+
+        int status;
+
+        UiccStatus(int stat) {
+            provisioned = true;
+            status = stat;
+        }
+
+    }
+
     // Service name
     private static final String EXT_TELEPHONY_SERVICE_NAME = "extphone";
 
@@ -81,8 +94,7 @@ public class HwExtTelephony extends IExtTelephony.Stub {
     private static SubscriptionManager sSubscriptionManager;
     private static TelecomManager sTelecomManager;
     private static TelephonyManager sTelephonyManager;
-    private static int sPreviousDataSlotId;
-    private static int sUiccStatus[];
+    private static UiccStatus sUiccStatus[];
 
     private Handler mHandler;
     private UiccController mUiccController;
@@ -90,26 +102,13 @@ public class HwExtTelephony extends IExtTelephony.Stub {
     public static void init(Context context, Phone[] phones, CommandsInterface[] commandsInterfaces) {
         sCommandsInterfaces = commandsInterfaces;
         sContext = context;
-        sInstance = getInstance();
         sPhones = phones;
         sSubscriptionManager = (SubscriptionManager) sContext.getSystemService(
                 Context.TELEPHONY_SUBSCRIPTION_SERVICE);
         sTelecomManager = TelecomManager.from(context);
         sTelephonyManager = TelephonyManager.from(context);
-        sPreviousDataSlotId = -1;
 
-        // Assume everything present is provisioned by default
-        sUiccStatus = new int[sPhones.length];
-        for (int i = 0; i < sPhones.length; i++) {
-            if (sPhones[i] == null) {
-                sUiccStatus[i] = INVALID_STATE;
-            } else if (sPhones[i].getUiccCard() == null) {
-                sUiccStatus[i] = CARD_NOT_PRESENT;
-            } else {
-                sUiccStatus[i] = sPhones[i].getUiccCard().getCardState() == CARDSTATE_PRESENT
-                        ? PROVISIONED : CARD_NOT_PRESENT;
-            }
-        }
+        sInstance = getInstance();
     }
 
     public static HwExtTelephony getInstance() {
@@ -125,7 +124,20 @@ public class HwExtTelephony extends IExtTelephony.Stub {
             ServiceManager.addService(EXT_TELEPHONY_SERVICE_NAME, this);
         }
 
-        // Keep track of ICC state
+        // Assume everything present is provisioned by default
+        sUiccStatus = new UiccStatus[sPhones.length];
+        for (int i = 0; i < sPhones.length; i++) {
+            if (sPhones[i] == null) {
+                sUiccStatus[i] = null;
+            } else if (sPhones[i].getUiccCard() == null) {
+                sUiccStatus[i] = new UiccStatus(CARD_NOT_PRESENT);
+            } else {
+                sUiccStatus[i] = new UiccStatus(sPhones[i].getUiccCard().getCardState()
+                        == CARDSTATE_PRESENT ? PROVISIONED : CARD_NOT_PRESENT);
+            }
+        }
+
+        // Keep track of ICC state changes
         mHandler = new Handler() {
             @Override
             public void handleMessage(Message msg) {
@@ -150,22 +162,17 @@ public class HwExtTelephony extends IExtTelephony.Stub {
 
         UiccCard card = sPhones[slotId].getUiccCard();
 
-        if (card == null) {
-            sUiccStatus[slotId] = CARD_NOT_PRESENT;
-            return;
-        }
-
-        if (sPreviousDataSlotId == slotId) {
-            sUiccStatus[slotId] = PROVISIONED;
-            deactivateUiccCard(slotId);
-            sPreviousDataSlotId = -1;
-        } else if (sUiccStatus[slotId] != NOT_PROVISIONED ||
-                card.getCardState() != CARDSTATE_PRESENT) {
-            if (card.getCardState() == CARDSTATE_PRESENT) {
-                sUiccStatus[slotId] = NOT_PROVISIONED;
+        if (card == null || card.getCardState() != CARDSTATE_PRESENT) {
+            sUiccStatus[slotId].status = CARD_NOT_PRESENT;
+        } else {
+            if (sUiccStatus[slotId].provisioned &&
+                    sUiccStatus[slotId].status != PROVISIONED) {
+                sUiccStatus[slotId].status = NOT_PROVISIONED;
                 activateUiccCard(slotId);
-            } else {
-                sUiccStatus[slotId] = CARD_NOT_PRESENT;
+            } else if (!sUiccStatus[slotId].provisioned &&
+                    sUiccStatus[slotId].status != NOT_PROVISIONED) {
+                sUiccStatus[slotId].status = PROVISIONED;
+                deactivateUiccCard(slotId);
             }
         }
 
@@ -176,6 +183,8 @@ public class HwExtTelephony extends IExtTelephony.Stub {
         UiccCard card = sPhones[slotId].getUiccCard();
 
         int numApps = card.getNumApplications();
+
+        sUiccStatus[slotId].provisioned = activate;
 
         for (int i = 0; i < numApps; i++) {
             if (card.getApplicationIndex(i) == null) {
@@ -189,23 +198,26 @@ public class HwExtTelephony extends IExtTelephony.Stub {
     private void broadcastUiccActivation(int slotId) {
         Intent intent = new Intent(ACTION_UICC_MANUAL_PROVISION_STATUS_CHANGED);
         intent.putExtra(PhoneConstants.PHONE_KEY, slotId);
-        intent.putExtra(EXTRA_NEW_PROVISION_STATE, sUiccStatus[slotId]);
+        intent.putExtra(EXTRA_NEW_PROVISION_STATE, sUiccStatus[slotId].status);
         sContext.sendBroadcast(intent);
     }
 
     @Override
     public int getCurrentUiccCardProvisioningStatus(int slotId) {
-        if (slotId >= sUiccStatus.length) {
+        if (slotId >= sUiccStatus.length || sUiccStatus[slotId] == null) {
             return INVALID_INPUT;
         }
 
-        return sUiccStatus[slotId];
+        return sUiccStatus[slotId].status;
     }
 
     @Override
     public int getUiccCardProvisioningUserPreference(int slotId) {
-        // I hope we don't use this
-        return getCurrentUiccCardProvisioningStatus(slotId);
+        if (slotId >= sUiccStatus.length || sUiccStatus[slotId] == null) {
+            return INVALID_INPUT;
+        }
+
+        return sUiccStatus[slotId].provisioned ? PROVISIONED : NOT_PROVISIONED;
     }
 
     @Override
@@ -215,19 +227,20 @@ public class HwExtTelephony extends IExtTelephony.Stub {
             return INVALID_INPUT;
         }
 
-        if (sUiccStatus[slotId] == PROVISIONED) {
+        if (sUiccStatus[slotId].status == PROVISIONED) {
             return SUCCESS;
         }
 
-        if (sUiccStatus[slotId] != NOT_PROVISIONED) {
+        if (sUiccStatus[slotId].status != NOT_PROVISIONED) {
             return INVALID_INPUT;
         }
+
+        sUiccStatus[slotId].status = PROVISIONED;
 
         setUiccActivation(slotId, true);
         sPhones[slotId].setVoiceActivationState(SIM_ACTIVATION_STATE_ACTIVATED);
         sPhones[slotId].setDataActivationState(SIM_ACTIVATION_STATE_ACTIVATED);
 
-        sUiccStatus[slotId] = PROVISIONED;
         broadcastUiccActivation(slotId);
 
         return SUCCESS;
@@ -240,23 +253,22 @@ public class HwExtTelephony extends IExtTelephony.Stub {
             return INVALID_INPUT;
         }
 
-        if (sUiccStatus[slotId] == NOT_PROVISIONED) {
+        if (sUiccStatus[slotId].status == NOT_PROVISIONED) {
             return SUCCESS;
         }
 
-        if (sUiccStatus[slotId] != PROVISIONED) {
+        if (sUiccStatus[slotId].status != PROVISIONED) {
             return INVALID_INPUT;
         }
 
         int subIdToDeactivate = sPhones[slotId].getSubId();
         int subIdToMakeDefault = INVALID_SUBSCRIPTION_ID;
 
+        sUiccStatus[slotId].status = NOT_PROVISIONED;
+
         // Find first provisioned sub that isn't what we're deactivating
         for (int i = 0; i < sPhones.length; i++) {
-            if (i == slotId) {
-                continue;
-            }
-            if (sUiccStatus[i] == PROVISIONED) {
+            if (sUiccStatus[i].status == PROVISIONED) {
                 subIdToMakeDefault = sPhones[i].getSubId();
                 break;
             }
@@ -271,7 +283,6 @@ public class HwExtTelephony extends IExtTelephony.Stub {
         }
 
         if (sSubscriptionManager.getDefaultDataSubscriptionId() == subIdToDeactivate) {
-            sPreviousDataSlotId = slotId;
             sSubscriptionManager.setDefaultDataSubId(subIdToMakeDefault);
         }
 
@@ -284,7 +295,6 @@ public class HwExtTelephony extends IExtTelephony.Stub {
         sPhones[slotId].setDataActivationState(SIM_ACTIVATION_STATE_DEACTIVATED);
         setUiccActivation(slotId, false);
 
-        sUiccStatus[slotId] = NOT_PROVISIONED;
         broadcastUiccActivation(slotId);
 
         return SUCCESS;
